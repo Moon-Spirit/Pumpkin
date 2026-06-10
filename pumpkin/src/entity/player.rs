@@ -40,7 +40,7 @@ use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::particle::Particle;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::tag::Taggable;
-use pumpkin_data::{Block, BlockState, Enchantment, tag, translation};
+use pumpkin_data::{Block, BlockState, Enchantment, screen::WindowType, tag, translation};
 use pumpkin_inventory::player::{
     player_inventory::PlayerInventory, player_screen_handler::PlayerScreenHandler,
 };
@@ -54,7 +54,9 @@ use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_nbt::tag::NbtTag;
 use pumpkin_protocol::IdOr;
 use pumpkin_protocol::SoundEvent;
+use pumpkin_protocol::bedrock::client::container_open::CContainerOpen;
 use pumpkin_protocol::codec::var_int::VarInt;
+use pumpkin_protocol::codec::var_long::VarLong;
 use pumpkin_protocol::java::client::play::{
     Animation, CAcknowledgeBlockChange, CActionBar, CChangeDifficulty, CCloseContainer,
     CCombatDeath, CCustomPayload, CDisguisedChatMessage, CEntityAnimation, CEntityPositionSync,
@@ -1531,7 +1533,7 @@ impl Player {
     }
 
     pub async fn get_off_ground_speed(&self) -> f64 {
-        let sprinting = self.get_entity().sprinting.load(Ordering::Relaxed);
+        let sprinting = self.get_entity().is_sprinting();
 
         if !self.get_entity().has_vehicle().await {
             let fly_speed = {
@@ -1566,7 +1568,7 @@ impl Player {
         // (LivingEntity#updateSwimming + entity swimming flag).
         entity.touching_water.load(Ordering::Relaxed)
             && entity.water_height.load() > swim_height
-            && entity.sprinting.load(Ordering::Relaxed)
+            && entity.is_sprinting()
             && !entity.on_ground.load(Ordering::Relaxed)
             && !flying
             && !entity.has_vehicle().await
@@ -1599,11 +1601,11 @@ impl Player {
             EntityPose::Sleeping
         } else if self.is_swimming(flying).await {
             EntityPose::Swimming
-        } else if entity.fall_flying.load(Ordering::Relaxed) {
+        } else if entity.is_fall_flying() {
             EntityPose::FallFlying
         } else if Self::is_auto_spin_attack() {
             EntityPose::SpinAttack
-        } else if entity.sneaking.load(Ordering::Relaxed) && !flying {
+        } else if entity.is_sneaking() && !flying {
             EntityPose::Crouching
         } else {
             EntityPose::Standing
@@ -1930,7 +1932,7 @@ impl Player {
     }
 
     pub async fn jump(&self) {
-        if self.living_entity.entity.sprinting.load(Ordering::Relaxed) {
+        if self.living_entity.entity.is_sprinting() {
             self.add_exhaustion(0.2).await;
         } else {
             self.add_exhaustion(0.05).await;
@@ -1942,7 +1944,7 @@ impl Player {
         if self.living_entity.entity.on_ground.load(Ordering::Relaxed) {
             let delta = (delta_pos.horizontal_length() * 100.0).round() as f32;
             if delta > 0.0 {
-                if self.living_entity.entity.sprinting.load(Ordering::Relaxed) {
+                if self.living_entity.entity.is_sprinting() {
                     self.add_exhaustion(0.1 * delta * 0.01).await;
                 } else {
                     self.add_exhaustion(0.0 * delta * 0.01).await;
@@ -2286,7 +2288,7 @@ impl Player {
                 self.send_permission_lvl_update();
 
                 player.clone().request_teleport(position, yaw, pitch).await;
-                player.living_entity.entity.last_pos.store(position);
+                player.get_entity().last_pos.store(position);
 
                 self.send_abilities_update().await;
 
@@ -2639,10 +2641,10 @@ impl Player {
                 // Stop elytra flight and reset sneaking when switching to spectator mode
                 if gamemode == GameMode::Spectator {
                     let entity = self.get_entity();
-                    if entity.fall_flying.load(Ordering::Relaxed) {
+                    if entity.is_fall_flying() {
                         entity.set_fall_flying(false).await;
                     }
-                    if entity.sneaking.load(Ordering::Relaxed) {
+                    if entity.is_sneaking() {
                         entity.set_sneaking(false).await;
                     }
                 }
@@ -3326,16 +3328,44 @@ impl Player {
             .await
         {
             let screen_handler_temp = screen_handler.lock().await;
+            let sync_id = screen_handler_temp.sync_id();
+            let window_type = screen_handler_temp
+                .window_type()
+                .expect("Can't open PlayerScreenHandler");
+
+            let display_name = screen_handler_factory.get_display_name();
+            let java_packet =
+                COpenScreen::new(sync_id.into(), (window_type as i32).into(), &display_name);
+
+            let bedrock_window_type = match window_type {
+                WindowType::Crafting => 1,
+                WindowType::Furnace => 2,
+                WindowType::Enchantment => 3,
+                WindowType::BrewingStand => 4,
+                WindowType::Anvil => 5,
+                WindowType::Hopper => 8,
+                WindowType::Beacon => 13,
+                WindowType::BlastFurnace => 27,
+                WindowType::Smoker => 28,
+                WindowType::Stonecutter => 29,
+                WindowType::CartographyTable => 30,
+                WindowType::Grindstone => 26,
+                WindowType::Loom => 24,
+                WindowType::Smithing => 34,
+                _ => 0,
+            };
+
+            let bedrock_packet = CContainerOpen {
+                container_id: sync_id,
+                container_type: bedrock_window_type,
+                position: block_pos.unwrap_or(BlockPos::ZERO),
+                target_entity_id: VarLong(-1),
+            };
+
             self.client
-                .enqueue_packet(&COpenScreen::new(
-                    screen_handler_temp.sync_id().into(),
-                    (screen_handler_temp
-                        .window_type()
-                        .expect("Can't open PlayerScreenHandler") as i32)
-                        .into(),
-                    &screen_handler_factory.get_display_name(),
-                ))
+                .enqueue_packet_editioned(&java_packet, &bedrock_packet)
                 .await;
+
             drop(screen_handler_temp);
             self.on_screen_handler_opened(screen_handler.clone()).await;
             *self.current_screen_handler.lock().await = screen_handler;
@@ -3366,16 +3396,42 @@ impl Player {
         }
 
         let screen_handler_temp = screen_handler.lock().await;
+        let sync_id = screen_handler_temp.sync_id();
+        let window_type = screen_handler_temp
+            .window_type()
+            .expect("Can't open PlayerScreenHandler");
+
+        let java_packet = COpenScreen::new(sync_id.into(), (window_type as i32).into(), &title);
+
+        let bedrock_window_type = match window_type {
+            WindowType::Crafting => 1,
+            WindowType::Furnace => 2,
+            WindowType::Enchantment => 3,
+            WindowType::BrewingStand => 4,
+            WindowType::Anvil => 5,
+            WindowType::Hopper => 8,
+            WindowType::Beacon => 13,
+            WindowType::BlastFurnace => 27,
+            WindowType::Smoker => 28,
+            WindowType::Stonecutter => 29,
+            WindowType::CartographyTable => 30,
+            WindowType::Grindstone => 26,
+            WindowType::Loom => 24,
+            WindowType::Smithing => 34,
+            _ => 0,
+        };
+
+        let bedrock_packet = CContainerOpen {
+            container_id: sync_id,
+            container_type: bedrock_window_type,
+            position: BlockPos::ZERO,
+            target_entity_id: VarLong(-1),
+        };
+
         self.client
-            .enqueue_packet(&COpenScreen::new(
-                screen_handler_temp.sync_id().into(),
-                (screen_handler_temp
-                    .window_type()
-                    .expect("Can't open PlayerScreenHandler") as i32)
-                    .into(),
-                &title,
-            ))
+            .enqueue_packet_editioned(&java_packet, &bedrock_packet)
             .await;
+
         drop(screen_handler_temp);
         self.on_screen_handler_opened(screen_handler.clone()).await;
         *self.current_screen_handler.lock().await = screen_handler;
